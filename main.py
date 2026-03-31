@@ -207,15 +207,27 @@ def download_photo(url: str) -> str | None:
     if not url or not url.startswith("http"):
         return None
     try:
-        r = requests.get(url, timeout=30)
+        # Конвертируем Google Drive ссылку в прямую
+        if "drive.google.com" in url:
+            m = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
+            if m:
+                url = f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+
+        r = requests.get(url, timeout=30, allow_redirects=True)
         if r.status_code != 200:
+            log.warning(f"Фото {url}: статус {r.status_code}")
+            return None
+        if len(r.content) < 1024:
+            log.warning(f"Фото слишком маленькое: {len(r.content)} байт")
             return None
         ext = ".jpg"
-        if "png" in url.lower():
+        ct = r.headers.get("content-type", "")
+        if "png" in ct or "png" in url.lower():
             ext = ".png"
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
         tmp.write(r.content)
         tmp.close()
+        log.info(f"  Фото скачано: {len(r.content)//1024}KB")
         return tmp.name
     except Exception as e:
         log.warning(f"Скачивание фото {url}: {e}")
@@ -235,16 +247,20 @@ def upload_avatar(group_id: int, photo_url: str) -> bool:
                 r["response"]["upload_url"],
                 files={"photo": f}, timeout=60
             ).json()
-        vk("photos.saveOwnerPhoto", {
+        r2 = vk("photos.saveOwnerPhoto", {
             "server": res["server"],
             "photo":  res["photo"],
             "hash":   res["hash"],
         })
+        if "error" in r2:
+            log.warning(f"  Аватарка отклонена VK: мин 200x200px, соотношение 0.25-3")
+            return False
         log.info("  Аватарка загружена")
         return True
     except Exception as e:
         log.warning(f"  Аватарка: {e}")
         return False
+    # VK требует: минимум 200x200px, соотношение 0.25-3
     finally:
         try: os.unlink(filepath)
         except: pass
@@ -267,9 +283,12 @@ def upload_cover(group_id: int, photo_url: str) -> bool:
                 r["response"]["upload_url"],
                 files={"photo": f}, timeout=60
             ).json()
-        vk("photos.saveOwnerCoverPhoto", {
+        r2 = vk("photos.saveOwnerCoverPhoto", {
             "hash": res["hash"], "photo": res["photo"]
         })
+        if "error" in r2:
+            log.warning(f"  Обложка отклонена VK: мин 911x364px")
+            return False
         log.info("  Обложка загружена")
         return True
     except Exception as e:
@@ -318,25 +337,30 @@ def upload_wall_photo(group_id: int, photo_url: str) -> str:
 def groq_generate(prompt: str, max_tokens: int = 800) -> str:
     if not GROQ_API_KEY:
         return ""
-    try:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "llama3-70b-8192",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
-                "temperature": 0.8,
-            },
-            timeout=30
-        )
-        return r.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        log.warning(f"Groq: {e}")
-        return ""
+    models = ["llama3-8b-8192", "mixtral-8x7b-32768", "llama3-70b-8192"]
+    for model in models:
+        try:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                    "temperature": 0.8,
+                },
+                timeout=30
+            )
+            data = r.json()
+            if "choices" in data and data["choices"]:
+                return data["choices"][0]["message"]["content"].strip()
+            log.warning(f"Groq {model} нет choices: {list(data.keys())}")
+        except Exception as e:
+            log.warning(f"Groq {model}: {e}")
+    return ""
 
 
 def ai_description(keyword: str, region: str, site: str) -> str:
@@ -462,7 +486,11 @@ def translit(text: str) -> str:
     res = "".join(t.get(c.lower(), c) for c in text)
     res = re.sub(r"[^a-z0-9_]", "", res)
     res = re.sub(r"_+", "_", res).strip("_")
-    return res[:50]
+    # VK требует: только латиница, цифры, подчёркивание, длина 5-32
+    res = res[:32]
+    if len(res) < 5:
+        res = res + "_club"
+    return res
 
 
 # ══════════════════════════════════════════════════════════════
@@ -589,12 +617,18 @@ def create_group(kw_data: dict, site: str) -> dict:
 
     # 7. URL через groups.edit screen_name
     screen_name = translit(keyword) + f"_{random.randint(10, 99)}"
-    r_sn = vk("groups.edit", {"group_id": gid, "screen_name": screen_name})
-    if "error" in r_sn:
+    # Пробуем разные варианты screen_name
+    sn_base = translit(keyword)[:25]
+    for attempt in range(3):
+        sn_try = f"{sn_base}_{random.randint(100,999)}"
+        r_sn = vk("groups.edit", {"group_id": gid, "screen_name": sn_try})
+        if "error" not in r_sn:
+            screen_name = sn_try
+            log.info(f"  URL: vk.com/{screen_name}")
+            break
+    else:
         screen_name = f"club{gid}"
         log.warning(f"  URL не установлен — {screen_name}")
-    else:
-        log.info(f"  URL: vk.com/{screen_name}")
 
     return {
         "success":    True,
@@ -716,7 +750,19 @@ def run_agent():
     try:
         init_sheet_headers(sheets)
     except Exception:
-        pass
+        pass  # Заголовки уже есть — норм
+
+    # Проверяем доступ к таблице
+    test = sheets_get(sheets, f"{SHEET_KEYS}!A1:A1")
+    if test is None:
+        tg_send(
+            "❌ <b>Нет доступа к Google Sheets!</b>\n\n"
+            "Открой таблицу → Настройки доступа → "
+            "добавь email сервисного аккаунта из credentials.json "
+            "как редактора."
+        )
+        _agent_running = False
+        return
 
     reset_stuck(sheets)
 
@@ -964,7 +1010,8 @@ def run_bot():
         except KeyboardInterrupt:
             break
         except Exception as e:
-            if "timed out" not in str(e).lower():
+            err_str = str(e).lower()
+            if "timed out" not in err_str and "read timeout" not in err_str:
                 log.error(f"Polling: {e}")
             time.sleep(2)
 
